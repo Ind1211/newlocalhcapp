@@ -1,0 +1,107 @@
+services:
+  # No postgres/pgadmin service here on purpose — this connects to your EXISTING,
+  # separately-running kidney_cardiology_db container instead of creating a new
+  # one. That container isn't part of this compose project, so backend reaches it
+  # via host.docker.internal (Docker Desktop's DNS name for "the host machine"),
+  # using the port your existing db container already publishes to the host
+  # (5432:5432). Keep that existing container running exactly as it is — nothing
+  # here manages its lifecycle.
+  azurite:
+    # Azurite is Microsoft's official local emulator for Azure Storage — it speaks
+    # the real Blob Storage protocol, so the exact same azure-storage-blob code path
+    # used against real Azure in production runs unchanged here. Replaces MinIO now
+    # that app/storage.py talks to Azure Blob Storage instead of an S3-compatible API.
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: kidney_cardiology_azurite
+    restart: unless-stopped
+    command: azurite-blob --blobHost 0.0.0.0 --blobPort 10000
+    volumes:
+      - azurite_data:/data
+    ports:
+      # Published mainly so Azure Storage Explorer (or a similar tool) can connect
+      # from the host if you want to inspect what's stored; the backend reaches
+      # this over the internal Docker network regardless.
+      - "10000:10000"
+
+  backend:
+    build:
+      context: ./backend-project
+    container_name: kidney_cardiology_backend
+    restart: unless-stopped
+    environment:
+      # Uses POSTGRES_PASSWORD_URLENCODED, not POSTGRES_PASSWORD directly — if your
+      # actual password contains an @ (or any other URL-special character), the raw
+      # value breaks this connection string, since psycopg2/SQLAlchemy can't tell
+      # where the password ends and the host begins.
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD_URLENCODED}@host.docker.internal:5432/${POSTGRES_DB}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Azurite's fixed, publicly-documented well-known dev account — not a real
+      # secret, safe to commit. Points at the azurite service below over the
+      # internal Docker network. For a real Azure deployment, replace this whole
+      # value with your Storage Account's real connection string (see
+      # claude/azure-container-apps-deployment-plan.md in the project notes).
+      AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+      SCHEDULER_INTERVAL_MINUTES: "1"
+      # For independently verifying JWTs on the backend, not just trusting that
+      # Kong already checked them. AUTH0_ISSUER must exactly match kong.yml's own
+      # consumer "key" value (https://YOUR_DOMAIN/, trailing slash included) —
+      # they're two independent checks against the same real value, not the same
+      # config reused, so keep both in sync manually if your domain ever changes.
+      AUTH0_AUDIENCE: ${VITE_AUTH0_AUDIENCE}
+      AUTH0_ISSUER: https://${VITE_AUTH0_DOMAIN}/
+      AUTH0_PUBLIC_KEY_PATH: /app/auth0-public-key.pem
+      # For the Auth0 Management API client — a separate, higher-privilege
+      # relationship with Auth0 than the JWT verification above. This M2M
+      # application must be authorized for the Management API with
+      # create:users, create:user_tickets, read:users, and update:users.
+      AUTH0_DOMAIN: ${VITE_AUTH0_DOMAIN}
+      AUTH0_M2M_CLIENT_ID: ${AUTH0_M2M_CLIENT_ID}
+      AUTH0_M2M_CLIENT_SECRET: ${AUTH0_M2M_CLIENT_SECRET}
+      AUTH0_SPA_CLIENT_ID: ${VITE_AUTH0_CLIENT_ID}
+    volumes:
+      - ./auth0-public-key.pem:/app/auth0-public-key.pem:ro
+    expose:
+      - "8000"
+    depends_on:
+      - azurite
+
+  frontend:
+    build:
+      context: ./frontend-project
+      args:
+        VITE_AUTH0_DOMAIN: ${VITE_AUTH0_DOMAIN}
+        VITE_AUTH0_CLIENT_ID: ${VITE_AUTH0_CLIENT_ID}
+        VITE_AUTH0_AUDIENCE: ${VITE_AUTH0_AUDIENCE:-}
+    container_name: kidney_cardiology_frontend
+    restart: unless-stopped
+    # No published port — Kong is now the only public entry point. This container
+    # is still reachable from other containers on the same Docker network by its
+    # service name (frontend:80), which is exactly what Kong's kong.yml expects.
+    expose:
+      - "80"
+    depends_on:
+      - backend
+
+  kong:
+    image: kong:3.6
+    container_name: kidney_cardiology_kong
+    restart: unless-stopped
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+    volumes:
+      - ./kong/kong.yml:/kong/kong.yml:ro
+    ports:
+      # 8080 is the one URL you share — everything (the page itself, /api/v1/*,
+      # /health) goes through this single port now.
+      - "8080:8000"
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  azurite_data:

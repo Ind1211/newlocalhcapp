@@ -1,0 +1,73 @@
+_format_version: "3.0"
+
+# DB-less mode: Kong reads this file directly, no separate Kong-config database
+# needed. Right for a deployment this size — a DB-backed setup with the Admin API
+# for dynamic changes is the better call once multiple people need to manage
+# routes/plugins independently, which isn't the case here.
+
+services:
+  # No longer versioned. The frontend calls /api/... directly now (see
+  # frontend-project/src/api/client.ts) because the Azure Container Apps deployment
+  # doesn't run Kong at all — keeping an /api/v1 prefix here only, and nowhere else,
+  # would make local docker-compose behave differently from production for no real
+  # benefit. Kong still fronts /api/* locally for rate limiting and as a second,
+  # redundant JWT check ahead of the backend's own independent verification (see
+  # backend-project/app/auth.py).
+  - name: backend-service
+    url: http://backend:8000/api
+    routes:
+      - name: backend-route
+        paths:
+          - /api
+        strip_path: true
+    plugins:
+      - name: rate-limiting
+        config:
+          minute: 60
+          policy: local
+          fault_tolerant: true
+      - name: jwt
+        config:
+          claims_to_verify:
+            - exp
+
+  # Health checks stay reachable with no token and no rate limit — standard
+  # practice, since monitoring/orchestration tooling checking liveness shouldn't
+  # need a user's credentials or be subject to the same limits as real traffic.
+  - name: health-service
+    url: http://backend:8000/health
+    routes:
+      - name: health-route
+        paths:
+          - /health
+        strip_path: true
+
+  # Everything else (the actual page, its JS/CSS) goes to the frontend container.
+  # This route is intentionally last / lowest priority — Kong matches the most
+  # specific path first, so /api/v1/* and /health are never shadowed by this
+  # catch-all.
+  - name: frontend-service
+    url: http://frontend:80
+    routes:
+      - name: frontend-catchall
+        paths:
+          - /
+        strip_path: false
+
+# One consumer representing "the SPA" — every valid Auth0-issued token for this
+# app authenticates as this same consumer.
+consumers:
+  - username: spa-frontend
+    jwt_secrets:
+      - algorithm: RS256
+        key: "https://dev-aqi0sphdxcy6rzov.us.auth0.com/"
+        rsa_public_key: |
+          -----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtKQCQ5w58LPAVH4Hdn8/
+          DT6+sdfV8gr/8GT06iJJv/heWQAqYt4B+Cz9XfvaL3/WWWGuN7xWdAiICMHBwO4I
+          M0Kqo97+7Lj5WeGRotnw/yRhC+r8OamG7MzONFgPsiNkOqSYdt8sfkGcGGhbKDqb
+          Ot5uAtGFNo9q1QTxdBC+43gJiNdkXNVLZx0bVFxcQsfy4uWK77dBlg9k837PoByH
+          r3eXdZ8U9aKqblP4t5iNDO1g3+IV9L4AQFL8aaqXviq3yPyBYBOCNKWiI+4sf9h3
+          BNnJPOQn+XGK3/SLRq4rG3HbW0Z4/9odqDSggEBCYiFWIuA0UjQitiy/m3wnzFe6
+          wwIDAQAB
+          -----END PUBLIC KEY-----
